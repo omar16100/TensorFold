@@ -41,7 +41,7 @@ class Weights:
     def has(self, name: str) -> bool:
         return name in self.where
 
-    def get(self, name: str) -> mx.array:
+    def get(self, name: str, *, eager: bool = True) -> mx.array:
         shard = self.where[name]
         loaded = self._cache.get(shard)
         if loaded is None:
@@ -52,9 +52,12 @@ class Weights:
                 if short is not None:
                     loaded[short] = value
             self._cache = {shard: loaded}          # one shard at a time: arrays already taken stay alive
-        return loaded[name]
+        value = loaded[name]
+        if eager:
+            mx.eval(value)  # Complete the stored-array read before GPU transforms.
+        return value
 
-    def q(self, prefix: str) -> Q:
+    def q(self, prefix: str, *, eager: bool = True) -> Q:
         """A quantized linear at the format the config states for it, checked against its shapes."""
 
         fmt = self.overrides.get(prefix, self.default)
@@ -63,10 +66,10 @@ class Weights:
             raise ValueError(f"{prefix}: stored {stored}; GLM-5.3-Flash's Mac engine reads MLX affine weights of "
                              f"{', '.join(map(str, BITS))} bits in groups of {', '.join(map(str, GROUPS))}")
         try:
-            s, b = self.get(f"{prefix}.scales"), self.get(f"{prefix}.biases")
+            s, b = self.get(f"{prefix}.scales", eager=eager), self.get(f"{prefix}.biases", eager=eager)
             if s.dtype == mx.float16:                      # exact in fp32; MLX would promote them on every call
                 s, b = s.astype(mx.float32), b.astype(mx.float32)
-            return Q(self.get(f"{prefix}.weight"), s, b, bits=fmt[0], group=fmt[1])
+            return Q(self.get(f"{prefix}.weight", eager=eager), s, b, bits=fmt[0], group=fmt[1])
         except ValueError as exc:
             raise ValueError(f"{prefix}: {exc}") from None
 
@@ -92,7 +95,7 @@ def _placeholder(w: Weights, m: str, proj: str) -> Q:
     """A routed projection's format and shapes with no experts: a stream's pool holds them (``stream.attach``)."""
 
     name = f"{m}.switch_mlp.{proj}" if w.has(f"{m}.switch_mlp.{proj}.weight") else f"{m}.experts.0.{proj}"
-    q = w.q(name)                                        # lazy: its bytes are never read
+    q = w.q(name, eager=False)                           # Retain lazy reads for expert placeholders.
     return Q(*(mx.zeros((0, *a.shape[-2:]), dtype=a.dtype) for a in q.arrays()), bits=q.bits, group=q.group)
 
 
@@ -223,4 +226,3 @@ def load(model_dir: Path, *, ssd_experts: float | None = None) -> tuple[GLM5, An
         stream.attach(model, Path(model_dir), float(ssd_experts))
     tokenizer = GlmTokenizer(load_tokenizer(Path(model_dir), eos_token_ids=model.args.eos_token_id or None))
     return model, tokenizer
-
