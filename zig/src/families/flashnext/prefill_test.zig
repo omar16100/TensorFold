@@ -21,6 +21,66 @@ fn stream(tokens: []const u32, id: []const u8) !lanes.Stream {
     return lanes.Stream.init(a, .{ .id = id, .prompt = tokens, .max_new = 4 });
 }
 
+const Yield = struct {
+    requested: bool = false,
+    fn check(ptr: *anyopaque) bool {
+        const state: *@This() = @ptrCast(@alignCast(ptr));
+        return state.requested;
+    }
+    fn arrived(ptr: *anyopaque, _: *lanes.Stream) void {
+        const state: *@This() = @ptrCast(@alignCast(ptr));
+        state.requested = true;
+    }
+};
+
+test "flashnext prefill: a whole warm pass yields after a request arrives between chunks" {
+    var f: Fake = .{};
+    defer f.deinit();
+    const tokens: [2051]u32 = @splat(5);
+    var s = try stream(&tokens, "warm");
+    defer s.deinit(a);
+    var state: Yield = .{};
+    s.yield_check = .{ .ptr = &state, .check = Yield.check };
+    f.chunk_hook = Yield.arrived;
+    f.chunk_ctx = &state;
+    try std.testing.expectError(error.Yielded, f.backend().prefill(&s));
+    try std.testing.expectEqual(@as(usize, 1), f.chunks);
+    try std.testing.expectEqual(@as(u32, 1024), s.fill_at.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), f.filling.count());
+    try std.testing.expectEqual(@as(usize, 0), f.target.lanes.count());
+    try std.testing.expectEqual(f.owners, f.freed);
+}
+
+test "flashnext prefill: a yield at each seam preserves another prompt and permits a fresh retry" {
+    const tokens: [33]u32 = @splat(5);
+    for (0..5) |seam| {
+        var f: Fake = .{};
+        defer f.deinit();
+        var state: Yield = .{};
+        var s = try stream(&tokens, "warm");
+        defer s.deinit(a);
+        s.chunks = &.{ 1, 7, 17, 32 };
+        s.yield_check = .{ .ptr = &state, .check = Yield.check };
+        var other = try stream(&tokens, "foreground");
+        defer other.deinit(a);
+        other.chunks = &.{17};
+        try std.testing.expect(!try fill.step(&f, &other));
+        for (0..seam) |_| try std.testing.expect(!try fill.step(&f, &s));
+        const before = s.fill_at.load(.monotonic);
+        state.requested = true;
+        try std.testing.expectError(error.Yielded, f.backend().prefill(&s));
+        try std.testing.expectEqual(before, s.fill_at.load(.monotonic));
+        try std.testing.expectEqual(@as(u32, 17), other.fill_at.load(.monotonic));
+        try std.testing.expect(!f.filling.contains(&s));
+        while (!try fill.step(&f, &other)) {}
+        try std.testing.expectEqualDeep(recording.reference(&tokens), f.complete.get(&other).?);
+        state.requested = false;
+        try f.backend().prefill(&s);
+        try std.testing.expectEqualDeep(recording.reference(&tokens), f.complete.get(&s).?);
+        try std.testing.expectEqual(f.owners, f.freed);
+    }
+}
+
 test "flashnext prefill: independent cursors retain restored prefixes, marks and prompt head state" {
     var f: Fake = .{ .restored_at = 3 };
     defer f.deinit();

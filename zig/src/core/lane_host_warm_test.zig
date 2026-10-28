@@ -44,6 +44,59 @@ const WarmChunks = struct {
     }
 };
 
+fn warmDuringPrefill(quiet_ns: u64) !void {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 3 };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.stepped(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2, .warm_turns = true });
+    host.warm_quiet = quiet_ns;
+    try host.start();
+    defer host.stop();
+    const prompt = [_]u32{ 2, 7, 1, 8 };
+    var warm: Box = .{};
+    var real: Box = .{};
+    const warm_request: Request = .{ .prompt = &prompt, .max_tokens = 0, .background = true };
+    const request: Request = .{ .prompt = &prompt, .max_tokens = 48 };
+    const Arrival = struct {
+        engine: Engine,
+        request: *const Request,
+        box: *Box,
+        sent: bool = false,
+        warm_chunks: usize = 0,
+        fn hook(ctx: *anyopaque, s: *lanes.Stream, _: usize) void {
+            const state: *@This() = @ptrCast(@alignCast(ctx));
+            if (s.max_new == 0) {
+                state.warm_chunks += 1;
+            } else if (!state.sent) {
+                state.sent = true;
+                state.engine.submit(2, state.request, .{ .ctx = state.box, .event = Box.event }) catch {};
+            }
+        }
+    };
+    var arrival: Arrival = .{ .engine = host.engine(), .request = &warm_request, .box = &warm };
+    target.prefill_hook = Arrival.hook;
+    target.prefill_hook_ctx = &arrival;
+    try host.engine().submit(1, &request, .{ .ctx = &real, .event = Box.event });
+    try std.testing.expectEqual(Reason.length, real.wait());
+    try std.testing.expectEqual(@as(usize, 48), real.tokens);
+    try std.testing.expectEqual(Reason.cancelled, warm.wait());
+    // The fake checks the yield hook after its first chunk.
+    try std.testing.expectEqual(@as(usize, if (quiet_ns == 0) 1 else 0), arrival.warm_chunks);
+}
+
+test "a warm pass yields to an incomplete foreground prompt without a quiet delay" {
+    try warmDuringPrefill(0);
+}
+
+test "a warm pass does not wait for quiet beside an incomplete foreground prompt" {
+    try warmDuringPrefill(20 * std.time.ns_per_ms);
+}
+
 test "a background warm pass steps aside for a request that arrives during it, and the request runs" {
     const gpa = std.testing.allocator;
     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);

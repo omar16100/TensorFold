@@ -26,6 +26,7 @@ pub fn start(b: anytype, s: *Stream, slot: ?usize) !void {
 pub fn step(b: anytype, s: *Stream) !bool {
     errdefer b.abortPrompt(s);
     if (s.isCancelled()) return error.Cancelled;
+    if (s.yields()) return error.Yielded;
     if (!b.filling.contains(s)) try start(b, s, null);
     var p = b.filling.get(s).?;
     const prompt = s.prompt();

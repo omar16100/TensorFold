@@ -10,6 +10,8 @@ const Box = struct {
     fake: *Fake,
     tokens: [2]std.ArrayList(u32) = @splat(.empty),
     prefills: [2]u32 = @splat(0),
+    cached: [2]?u32 = @splat(null),
+    reasons: [2]?api.Reason = @splat(null),
     first_order: [2]api.Id = undefined,
     n_first: usize = 0,
     done: std.atomic.Value(u32) = .init(0),
@@ -20,7 +22,8 @@ const Box = struct {
             .tokens => |ts| b.tokens[id - 1].appendSlice(a, ts) catch {
                 b.bad = true;
             },
-            .prefilled => {
+            .prefilled => |cached| {
+                b.cached[id - 1] = cached;
                 b.prefills[id - 1] += 1;
                 if (b.n_first == b.first_order.len or b.fake.ends <= b.n_first) {
                     b.bad = true;
@@ -30,6 +33,7 @@ const Box = struct {
                 }
             },
             .finished => |end| {
+                b.reasons[id - 1] = end.reason;
                 if (end.reason == .failed) b.bad = true;
                 _ = b.done.fetchAdd(1, .release);
             },
@@ -56,6 +60,78 @@ fn finished(box: *const Box) !void {
 }
 fn config() !lanes.Config {
     return lanes.Config.init(a, .{ .exact_width = 2, .mtp = true, .speculate = true, .drafts = 1, .hidden_rows = true, .streams_exact = true, .batch_rows = 4, .max_streams = 2, .draft_streams = true }, 2, 1);
+}
+
+test "flashnext prefill: an interrupted warm pass retains a cache mark and the next reply keeps its tokens" {
+    var f: Fake = .{};
+    defer f.deinit();
+    var cfg = try config();
+    defer cfg.deinit(a);
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(a, &cfg, f.backend(), clock.clock());
+    defer core.deinit();
+    const pc = api.prompt_cache;
+    const Snapshots = struct {
+        fn bytes(_: *anyopaque, at: u32) u64 {
+            return 64 + 4 * @as(u64, at);
+        }
+        fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) !pc.Saved {
+            const target: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
+            return target.save(@ptrCast(@alignCast(owner.?)), at);
+        }
+        fn restore(_: *anyopaque, _: ?*anyopaque, _: pc.Saved) !void {
+            return error.BackendRestores;
+        }
+        fn drop(ptr: *anyopaque, saved: pc.Saved) void {
+            const target: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
+            target.drop(saved);
+        }
+    };
+    const snapshots = pc.Snapshots{ .ptr = &f.target, .vtable = &.{ .bytes = Snapshots.bytes, .save = Snapshots.save, .restore = Snapshots.restore, .drop = Snapshots.drop } };
+    var store = pc.Store.init(a, snapshots, .{ .lookahead = 1, .planned = true, .warm = .on, .min_prompt = 0, .min_gap = 1 }, 1 << 20);
+    defer store.deinit();
+    var host = api.LaneHost.init(a, std.testing.io, &core, .{ .lanes = 2, .warm_turns = true });
+    host.cache = &store;
+    var box: Box = .{ .fake = &f };
+    defer box.deinit();
+    const prompt: [2051]u32 = @splat(5);
+    const warm: api.Request = .{ .prompt = &prompt, .max_tokens = 0, .background = true, .history_len = prompt.len, .chunks = &.{ 1024, 2048 }, .shared_prefixes = &.{1024} };
+    const real: api.Request = .{ .prompt = &prompt, .max_tokens = 16, .history_len = prompt.len, .chunks = &.{ 1024, 2048 }, .shared_prefixes = &.{1024} };
+    const Arrival = struct {
+        engine: api.Engine,
+        request: *const api.Request,
+        box: *Box,
+        sent: bool = false,
+        fn hook(ptr: *anyopaque, s: *lanes.Stream) void {
+            const state: *@This() = @ptrCast(@alignCast(ptr));
+            if (s.max_new != 0 or state.sent) return;
+            state.sent = true;
+            state.engine.submit(2, state.request, .{ .ctx = state.box, .event = Box.event }) catch @panic("test request failed");
+        }
+    };
+    var arrival: Arrival = .{ .engine = host.engine(), .request = &real, .box = &box };
+    f.chunk_hook = Arrival.hook;
+    f.chunk_ctx = &arrival;
+    try host.engine().submit(1, &warm, .{ .ctx = &box, .event = Box.event });
+    try host.start();
+    var stopped = false;
+    defer if (!stopped) host.stop();
+    try finished(&box);
+    host.stop();
+    stopped = true;
+    try std.testing.expect(!box.bad);
+    try std.testing.expectEqual(api.Reason.cancelled, box.reasons[0].?);
+    try std.testing.expectEqual(api.Reason.length, box.reasons[1].?);
+    try std.testing.expectEqual(@as(?u32, 1024), box.cached[1]);
+    try std.testing.expectEqual(@as(usize, 16), box.tokens[1].items.len);
+    var history: std.ArrayList(u32) = .empty;
+    defer history.deinit(a);
+    try history.appendSlice(a, &prompt);
+    for (box.tokens[1].items) |token| {
+        try std.testing.expectEqual(lanes.fake.next(history.items, null, history.items.len), token);
+        try history.append(a, token);
+    }
+    try std.testing.expectEqual(f.owners, f.freed);
 }
 
 fn run(drafts: bool, sampled: bool, concurrent: bool) !Box {
